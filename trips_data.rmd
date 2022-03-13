@@ -1,0 +1,287 @@
+---
+title: "Bike Trips analysis"
+author: "Musa Karimli"
+date: "3/7/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Data importing
+
+Because data was too large for my memory to handle, I exported CSV files to a local SQL server(Postgres), then imported data from here.
+
+Let's first import data from sql:
+
+```{r,message=FALSE,warning=FALSE,echo=-25}
+library(tidyverse)
+library('RPostgreSQL')
+library(dplyr)
+
+con <- dbConnect(drv =PostgreSQL(), 
+                 user="postgres", 
+                 password="sinif555a",
+                 host="localhost", 
+                 port=5432, 
+                 dbname="customer_data")
+
+dbListTables(con)   #list all the tables 
+
+
+# query the order table
+trips <- dbGetQuery(con, "SELECT * from trip.tripdata;")
+
+trips<-as_tibble(trips)
+
+glimpse(trips)
+summary(trips)
+
+```
+
+
+
+## Data cleaning and transformation
+
+1. Dealing With date and time:
+
+```{r datetime,message=FALSE,warning=FALSE}
+library(lubridate)
+
+# converting string to datetime
+trips$ended_at <- ymd_hms(trips$ended_at)
+trips$started_at <- ymd_hms(trips$started_at)
+
+# calculating trip duration
+trips['trip_duration']=trips$ended_at-trips$started_at
+
+# excluding trips which are lasted zero seconds or below
+trips <- trips %>% filter(trip_duration>0)
+
+# extracting date components
+trips$start_year <- year(trips$started_at)
+trips$start_month <- month(trips$started_at)
+trips$start_quarter <- quarter(trips$started_at)
+trips$start_week <- week(trips$started_at)
+trips$start_wday <- wday(trips$started_at)
+trips$start_day <- day(trips$started_at)
+trips$start_hour <- hour(trips$started_at)
+trips$start_year_month <- floor_date(as_date(trips$started_at),"month")
+```
+
+
+2. Dealing with null and duplicate values:
+
+```{r null and duplicates,message=FALSE,warning=FALSE}
+# replacing NA stations names with no info
+trips <- trips %>% 
+    mutate(start_station_name = case_when(start_station_name==''~'No info',
+                                        is.na(start_station_name)~'No info',
+                                        TRUE ~start_station_name))%>%
+             mutate(start_station_name = case_when(end_station_name==''~'No info',
+                                      is.na(end_station_name)~'No info',
+                                      TRUE ~end_station_name))
+
+
+# there isn't any duplicate in "ride_id" column
+trips %>% count(ride_id) %>% 
+    filter(n>1)
+
+```
+
+3. Cleaning String Data:
+
+```{r dealing with strings,message=FALSE,warning=FALSE}
+
+library(stringr)
+
+trips <- trips %>% 
+    mutate(start_station_name = str_trim(start_station_name,side='both')) %>% 
+    mutate(end_station_name = str_trim(end_station_name,side='both')) %>% 
+    mutate(start_station_name = str_to_title(start_station_name)) %>% 
+    mutate(end_station_name = str_to_title(end_station_name))
+
+
+```
+
+
+4. Adding additonal columns for data analysis:
+
+```{r distance and speed,message=FALSE,warning=FALSE}
+
+library("geosphere")
+# finding the shortest distance between two locations
+trips <- trips %>% mutate(distance_ctd = distHaversine(cbind(start_lng, start_lat), 
+                                                       cbind(end_lng, end_lat)))
+# finding approximate speed of the ride
+trips<-transform(trips,speed=distance_ctd/as.double(trip_duration,units='secs'))
+
+# setting abnormal values to NA so it won't affect to the calculations
+trips <- trips %>% 
+    mutate(speed = case_when(speed==0 ~ NA_real_,
+                            is.infinite(speed) ~ NA_real_,
+                            TRUE ~ as.numeric(speed)))
+
+trips <- trips %>% 
+    mutate(distance_ctd = case_when(distance_ctd==0 ~ NA_real_,
+                             is.infinite(distance_ctd) ~ NA_real_,
+                             TRUE ~ as.numeric(distance_ctd)))
+
+```
+
+## Data analysis
+
+Looking at the data with summarization:
+
+```{r summary, message=FALSE,warning=FALSE}
+
+
+trips %>% group_by(member_casual,rideable_type) %>% 
+    summarise("avg_duration_trip"=mean(trip_duration,na.rm=T),
+              "avg_trip_distance"=mean(distance_ctd,na.rm=TRUE),
+              "avg_speed"=mean(speed,na.rm=T),
+              "n_of_rides"=format(n(),scientific=F))
+
+
+trips %>% group_by(start_year,start_quarter,start_month) %>% 
+    summarise("avg_duration_trip"=mean(trip_duration,na.rm=T),
+              "avg_trip_distance"=mean(distance_ctd,na.rm=TRUE),
+              "avg_speed"=mean(speed,na.rm=T),
+              "n_of_rides"=format(n(),scientific=F))
+
+
+trips %>% group_by(start_year,start_quarter,start_month,member_casual) %>% 
+    summarise("avg_duration_trip"=mean(trip_duration,na.rm=T),
+              "avg_trip_distance"=mean(distance_ctd,na.rm=TRUE),
+              "avg_speed"=mean(speed,na.rm=T),
+              "n_of_rides"=format(n(),scientific=F))
+```
+
+- We can see that members ride bikes faster and shorter rides than casual riders.
+- It is clear that members use a bike to commute to work daily. Also, exact start and end locations indicate that people didn't ride bikes to work—these values are not considered in several below analyses.
+
+- Casual riders move more on weekends because of additional free time.
+
+- The graph below supports this theory by showing that members' rides are much more than casuals' at the beginning and end of working hours.
+
+```{r Plot by hour, echo=FALSE,message=FALSE,warning=FALSE}
+library(scales)
+trips %>% group_by(start_hour,member_casual) %>% 
+        summarise("avg_duration_trip"=mean(trip_duration,na.rm=T),
+                  "avg_trip_distance"=mean(distance_ctd,na.rm=TRUE),
+                  "avg_speed"=mean(speed,na.rm=T),
+                  "n_of_rides"=as.numeric(format(n(),scientific=F))) %>% 
+    ggplot(mapping = aes(x=start_hour,y=n_of_rides,color=member_casual,group=1))+
+    geom_point() + 
+    scale_y_continuous(labels = unit_format(unit = "K", scale = 1e-3))+
+    scale_x_continuous(breaks=seq(0,23,2))+
+    stat_smooth()+
+    labs(x='Hour',y='Number of Rides',title='Number of rides by membership')
+
+trips %>% 
+    group_by(start_wday,member_casual,rideable_type) %>% 
+    summarise("avg_duration_trip"=mean(trip_duration,na.rm=T),
+              "n_of_rides"=as.numeric(format(n(),scientific=F))) %>%
+    ggplot(mapping = aes(x=start_wday,y=n_of_rides,color=member_casual,group=1))+
+    geom_point() + 
+    scale_y_continuous(labels = unit_format(unit = "K", scale = 1e-3))+
+    scale_x_continuous(breaks=seq(0,7,1))+
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+    facet_grid(rows=vars(rideable_type))+
+    stat_smooth()+
+    labs(x='Weekday',y='Number of Rides',title='Number of rides Trend')
+```
+
+
+- It is also worth mentioning that rides are increasing in the summer months because, in the winter months, people will likely use alternative transport due to cold weather. Also, cold weather may damage bikes. Average speed increase in winter also backs this theory because people will ride faster in the cold to warm up.
+
+```{r Plot_by_Month, echo=FALSE,message=FALSE,warning=FALSE}
+
+trips %>% group_by(start_month,member_casual) %>% 
+    summarise("avg_duration_trip"=mean(trip_duration,na.rm=T),
+              "avg_trip_distance"=mean(distance_ctd,na.rm=TRUE),
+              "avg_speed"=mean(speed,na.rm=T),
+              "n_of_rides"=as.numeric(format(n(),scientific=F))) %>% 
+    ggplot(mapping = aes(x=start_month,y=n_of_rides,color=member_casual,group=1))+
+    geom_point() + 
+    scale_y_continuous(labels = unit_format(unit = "K", scale = 1e-3))+
+    scale_x_continuous(breaks=seq(0,12,1))+
+    stat_smooth()+
+    labs(x='Month',y='Number of Rides',title='Number of rides by membership')
+```
+
+
+- Looking at members' rides' duration and distance at peak hours, I can find how many casual riders have a similar type of ride.
+
+```{r casual_similar_to_members,message=FALSE,warning=FALSE}
+
+# finding average duration and distance of members' rides at peak hours
+
+trips %>% filter(((start_hour>=8)&(start_hour<=10))
+                 |((start_hour>=16)&(start_hour<=18))
+                 &(member_casual=='member')) %>%
+                    summarise('average_dur' = mean(trip_duration,na.rm=T),
+                              'average_dist' = mean(distance_ctd,na.rm=T))
+# finding similar type of casual rides
+casual_rides <- trips %>%
+    filter((start_hour>=8&start_hour<=10)
+                 |(start_hour>=16&start_hour<=18)) %>% 
+               filter((member_casual=='casual')&(distance_ctd<=2287)
+                 &(trip_duration<duration(964,units = 'second'))) 
+
+cat('Casual rides in peak hours:', nrow(casual_rides),sep = ' ')
+
+# Assuming those casual riders used bikes for commuting to work, dividing the average of these rides by working days, we could know how many casual riders we are missing from membership.
+
+(casual_rides %>% 
+group_by(start_month,member_casual) %>% 
+    summarise("avg_duration_trip"=mean(trip_duration,na.rm=T),
+              "avg_trip_distance"=mean(distance_ctd,na.rm=TRUE),
+              "avg_speed"=mean(speed,na.rm=T),
+              "n_of_rides"=as.numeric(format(n(),scientific=F)))%>% 
+    summarise('avg_rides'=mean(n_of_rides)) %>% 
+    summarise(mean(avg_rides)))/22
+```
+
+Let's dive deeper into rideable types:
+
+```{r Plot by Month, echo=FALSE,message=FALSE,warning=FALSE}
+trips %>% 
+    group_by(start_year,start_quarter,member_casual,rideable_type) %>% 
+    summarise("avg_duration_trip"=mean(trip_duration,na.rm=T),
+              "n_of_rides"=as.numeric(format(n(),scientific=F))) %>% 
+    ggplot(mapping = aes(x=member_casual,y=n_of_rides,fill=rideable_type))+
+    geom_col()+
+    facet_wrap(~start_quarter)+
+    scale_y_continuous(labels = unit_format(unit = "M", scale = 1e-6))+
+    labs(x='Membership',y='Number of Rides',title='Number of rides by membership')
+
+```
+
+- It is evident that people prefer classic bikes. Docked bikes seem to be a new type of ride, electric bikes are less popular than classic bikes, but it has the potential to become more popular, we can see in the trend line.
+
+```{r Trend, echo=FALSE,message=FALSE,warning=FALSE}
+trips %>% 
+    group_by(start_year_month,member_casual,rideable_type) %>% 
+    summarise("avg_duration_trip"=mean(trip_duration,na.rm=T),
+              "n_of_rides"=as.numeric(format(n(),scientific=F))) %>%
+    ggplot(mapping = aes(x=start_year_month,y=n_of_rides,color=member_casual,group=1))+
+    geom_point() + 
+    scale_y_continuous(labels = unit_format(unit = "K", scale = 1e-3))+
+    scale_x_date(date_breaks = '1 month')+
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+    facet_grid(rows=vars(rideable_type))+
+    stat_smooth()+
+    labs(x='Date',y='Number of Rides',title='Number of rides Trend')
+```
+
+
+
+## Wrap Up
+
+I would propose incentivizing individuals to use cycles as daily transport to commute. Acknowledging that using bikes reduces carbon emissions and traffic jams will help people use them. There are still people who don't subscribe as members who use bicycles. Campaigns, emails, and billboards may assist people in understanding the importance of lowering dependency on non-renewable energy.
+
+Further, seasonal subscriptions, for example, making summer and winter plans differently, will draw more people in the summer to subscribe. But to expand membership in the winter, investing extra funds to have winter equipment to rent may benefit. Also, bikes need to be serviced accordingly. For example, bicycles may need better quality tires.
+
+Investing in electric bikes may allow more people to commute because some people are also afraid of sweating, and it is less tiring than traditional bikes.
